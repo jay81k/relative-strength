@@ -32,6 +32,9 @@ YFINANCE_EXCHANGE_MAP = {
     "BTS": "BATS",
 }
 
+# Added: Bad suffixes for warrants, units, rights, preferreds, etc.
+BAD_SUFFIXES = ('.W', '-W', '.U', '-U', '^', '.R', '-R', '.P', '-P')
+
 def exchange_from_yfinance(code):
     return YFINANCE_EXCHANGE_MAP.get(code, code if code else "n/a")
 
@@ -73,6 +76,16 @@ def fetch_ticker_info(symbol, max_retries=3):
                 info = t.info
                 if not info or "symbol" not in info:
                     raise ValueError("Empty info")
+                
+                # Added: Filter out ETFs and Shell Companies upfront from metadata
+                qtype = str(info.get("quoteType", "")).upper()
+                if qtype in ("ETF", "MUTUALFUND", "INDEX"):
+                    return None
+                
+                industry = str(info.get("industry", "")).upper()
+                if "SHELL COMPANIES" in industry:
+                    return None
+
                 result["industry"]            = info.get("industry") or "n/a"
                 result["sector"]              = info.get("sector")   or "n/a"
                 result["shortPercentOfFloat"] = (
@@ -112,7 +125,9 @@ def get_nasdaq_tickers():
         etf    = vals[5].strip()
         test   = vals[7].strip()
         if symbol and etf == "N" and test == "N" and symbol.isalpha() and len(symbol) <= 5:
-            tickers.add(symbol)
+            # Added: skip bad suffixes instantly
+            if not any(symbol.endswith(s) or s in symbol for s in BAD_SUFFIXES):
+                tickers.add(symbol)
     print(f"NASDAQ list: {len(tickers)} tickers")
     return tickers
 
@@ -129,8 +144,12 @@ def main():
     # Get current NASDAQ tickers
     nasdaq_tickers = get_nasdaq_tickers()
 
-    # Union: refresh all existing + add new ones
-    all_tickers = sorted(nasdaq_tickers | set(cache.keys()))
+    # Union: refresh all existing + add new ones (Modified to filter out bad suffixes globally)
+    raw_universe = nasdaq_tickers | set(cache.keys())
+    all_tickers = sorted([
+        t for t in raw_universe 
+        if not any(t.endswith(s) or s in t for s in BAD_SUFFIXES)
+    ])
     print(f"Total to process: {len(all_tickers)} tickers")
 
     updated = 0
