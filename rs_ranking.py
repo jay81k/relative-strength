@@ -83,6 +83,44 @@ def load_industry_overrides(path):
 
 INDUSTRY_OVERRIDES = load_industry_overrides(OVERRIDES_FILE)
 
+# ── Excluded tickers ──────────────────────────────────────────────────────────
+# excluded_tickers.csv (repo root) with a single column: Ticker.
+# Listed tickers (e.g. just-acquired companies) are skipped entirely: they do
+# not appear in rs_stocks.csv, the percentiles, or any industry average.
+EXCLUDE_FILE = os.path.join(DIR, "excluded_tickers.csv")
+
+def load_excluded_tickers(path):
+    """Returns a set of uppercase tickers. Never raises: warns and returns set()."""
+    if not os.path.exists(path):
+        print(f"ℹ {path} not found — no tickers excluded.")
+        return set()
+    try:
+        edf = pd.read_csv(path, dtype=str)
+    except pd.errors.EmptyDataError:
+        print("ℹ excluded_tickers.csv is empty — no tickers excluded.")
+        return set()
+    except Exception as exc:
+        print(f"⚠ WARNING: could not read excluded_tickers.csv ({exc}) — NO tickers excluded.")
+        return set()
+    edf.columns = [str(c).strip() for c in edf.columns]
+    if "Ticker" not in edf.columns:
+        print("⚠ WARNING: excluded_tickers.csv has no 'Ticker' column — NO tickers excluded.")
+        return set()
+    excluded = set()
+    for v in edf["Ticker"].dropna():
+        t = str(v).strip().upper()
+        if t:
+            excluded.add(t)
+    print(f"✓ Loaded {len(excluded)} excluded ticker(s).")
+    return excluded
+
+EXCLUDED_TICKERS = load_excluded_tickers(EXCLUDE_FILE)
+
+_both = sorted(EXCLUDED_TICKERS & set(INDUSTRY_OVERRIDES))
+if _both:
+    print(f"⚠ {len(_both)} ticker(s) are in BOTH excluded_tickers.csv and "
+          f"industry_overrides.csv (exclusion wins): {', '.join(_both)}")
+
 # ── Column titles ─────────────────────────────────────────────────────────────
 
 TITLE_RANK       = "Rank"
@@ -192,8 +230,12 @@ def rankings():
     ref = price_data[REFERENCE_TICKER]
     override_ranked = set()      # override tickers that made it into the ranking
     override_skipped = {}        # override ticker -> reason it did not
+    excluded_skipped = set()     # excluded tickers actually found and skipped
 
     for ticker in price_data:
+        if ticker.upper() in EXCLUDED_TICKERS:
+            excluded_skipped.add(ticker.upper())
+            continue
         if not cfg("SP500") and price_data[ticker].get("universe") == "S&P 500":
             continue
         if not cfg("SP400") and price_data[ticker].get("universe") == "S&P 400":
@@ -303,7 +345,11 @@ def rankings():
         # In price data but never reached ranking and no reason recorded yet
         # (e.g. universe filtered out in config.yaml)
         for t in sorted((set(INDUSTRY_OVERRIDES) & price_keys) - override_ranked):
-            override_skipped.setdefault(t, "filtered out (universe setting in config.yaml?)")
+            override_skipped.setdefault(
+                t,
+                "excluded via excluded_tickers.csv" if t in EXCLUDED_TICKERS
+                else "filtered out (universe setting in config.yaml?)"
+            )
 
         print(f"✓ Overrides ranked: {len(override_ranked)} of {len(INDUSTRY_OVERRIDES)} tickers")
         if not_in_prices:
@@ -325,6 +371,15 @@ def rankings():
                   f"{', '.join(thin)}")
         else:
             print("✓ All custom industries have 2+ ranked tickers.")
+
+    # ── Exclusion diagnostics ────────────────────────────────────────────────
+    if EXCLUDED_TICKERS:
+        price_keys_ex = {t.upper() for t in price_data}
+        not_found = sorted(EXCLUDED_TICKERS - price_keys_ex)
+        print(f"✓ Excluded {len(excluded_skipped)} of {len(EXCLUDED_TICKERS)} listed ticker(s) from ranking.")
+        if not_found:
+            print(f"⚠ {len(not_found)} excluded ticker(s) NOT in price_history.json "
+                  f"(typo, or already gone?): {', '.join(not_found)}")
 
     dfs = []
 
