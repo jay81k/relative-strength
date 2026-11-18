@@ -19,6 +19,12 @@ jobs:
       - name: Checkout relative-strength repo
         uses: actions/checkout@v4
 
+      # ── 1.5. Download Fred's pre-built ticker_info.json cache ───────────────
+      - name: Download Fred's pre-built ticker_info.json
+        run: |
+          mkdir -p data_persist
+          curl -f -L -o data_persist/ticker_info.json "https://raw.githubusercontent.com/Fred6725/relative-strength/main/data_persist/ticker_info.json"
+
       # ── 2. Set up Python 3.11 ──────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
