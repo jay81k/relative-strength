@@ -2,7 +2,9 @@ name: Generate RS Ratings
 
 on:
   schedule:
-    - cron: '30 23 * * 1-5'
+    # Runs Tuesday through Saturday at 02:17 UTC 
+    # (Which is Monday through Friday at 9:17 PM EST)
+    - cron: '17 2 * * 2-6'
   workflow_dispatch:
 
 jobs:
