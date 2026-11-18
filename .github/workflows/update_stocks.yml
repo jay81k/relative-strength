@@ -2,13 +2,16 @@ name: Update Stocks Data Weekly
 
 on:
   schedule:
-    - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
-  workflow_dispatch:
+    # Runs every Sunday at 00:00 UTC (Saturday at 7:00 PM EST)
+    - cron: '0 0 * * 0'
+  workflow_dispatch: # Allows manual runs from the Actions tab
 
 jobs:
   update-stocks:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6h max — 6800 tickers × ~1.5s = ~3h expected
+    timeout-minutes: 360 # 6h max — 6800 tickers × ~1.5s = ~3h expected
+    permissions:
+      contents: write # Required for GITHUB_TOKEN to push ticker_info.json back to your repo
 
     steps:
       - name: Checkout code
@@ -32,7 +35,7 @@ jobs:
         run: |
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
-          git add data_persist/ticker_info.json
+          git add -f data_persist/ticker_info.json
           git diff --staged --quiet || git commit -m "Weekly ticker_info refresh $(date +'%Y-%m-%d')"
           git push
         env:
