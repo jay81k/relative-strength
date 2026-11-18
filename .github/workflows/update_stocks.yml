@@ -9,34 +9,78 @@ on:
 jobs:
   update-stocks:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6h max — 6800 tickers × ~1.5s = ~3h expected
+    timeout-minutes: 360 # 6h max — ~3h expected
     permissions:
       contents: write # Required for GITHUB_TOKEN to push ticker_info.json back to your repo
 
     steps:
+      # ── 1. Checkout your fork ──────────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # ── 2. Set up Python 3.11 ──────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
+      # ── 3. Install dependencies ────────────────────────────────────────────
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install yfinance curl_cffi requests pandas
 
+      # ── 4. Run weekly stock update ─────────────────────────────────────────
       - name: Run weekly stock update
         run: python data_persist/update_stocks.py
 
+      # ── 5. Filter out ETFs, Trusts, Warrants, and Shell Companies / SPACs ──
+      - name: Filter out ETFs and shell companies from ticker_info.json
+        run: |
+          python -c "
+          import json
+
+          path = 'data_persist/ticker_info.json'
+          with open(path, 'r') as f:
+              data = json.load(f)
+
+          exclude_keywords = (
+              'ETF', 'INDEX FUND', 'TRUST', 'PROSHARES', 'DIREXION', 'ISHARES',
+              'VANGUARD', 'SPDR', 'INVESCO', 'SCHWAB', 'GRANITESHARES', 'LEVERAGED',
+              'ACQUISITION CORP', 'BLANK CHECK', 'SPAC', 'CAPITAL CORP', 'HOLDING ACQUISITION'
+          )
+          bad_suffixes = ('.W', '-W', '.U', '-U', '^', '.R', '-R', '.P', '-P')
+
+          filtered = {}
+          for sym, info in data.items():
+              if any(s in sym for s in bad_suffixes):
+                  continue
+              if not isinstance(info, dict):
+                  continue
+              qtype = str(info.get('quoteType', '')).upper()
+              if qtype in ('ETF', 'MUTUALFUND', 'INDEX'):
+                  continue
+              industry = str(info.get('industry', '')).upper()
+              if 'SHELL COMPANIES' in industry:
+                  continue
+              name = str(info.get('longName') or info.get('shortName') or '').upper()
+              if any(kw in name for kw in exclude_keywords):
+                  continue
+              filtered[sym] = info
+
+          print(f'Filtered ticker_info.json: {len(data)} -> {len(filtered)} operating stocks')
+          with open(path, 'w') as f:
+              json.dump(filtered, f, indent=2)
+          "
+
+      # ── 6. Force-commit & push cleaned ticker_info.json ────────────────────
       - name: Commit and push updated ticker_info.json
         run: |
           git config user.email "action@github.com"
           git config user.name "GitHub Action"
           git add -f data_persist/ticker_info.json
-          git diff --staged --quiet || git commit -m "Weekly ticker_info refresh $(date +'%Y-%m-%d')"
+          git diff --staged --quiet || git commit -m "Weekly ticker_info refresh (filtered) $(date +'%Y-%m-%d')"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
