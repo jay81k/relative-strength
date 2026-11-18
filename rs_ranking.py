@@ -40,6 +40,49 @@ ALL_STOCKS = cfg("USE_ALL_LISTED_STOCKS")
 TICKER_INFO_FILE = os.path.join(DIR, "data_persist", "ticker_info.json")
 TICKER_INFO_DICT = read_json(TICKER_INFO_FILE)
 
+# ── Custom industry overrides ─────────────────────────────────────────────────
+# industry_overrides.csv (repo root) with columns: Ticker, Industry, Sector.
+# A listed ticker uses YOUR industry/sector instead of the one from the data
+# source, so custom dashboard industries get ranked in rs_industries.csv.
+OVERRIDES_FILE = os.path.join(DIR, "industry_overrides.csv")
+
+def load_industry_overrides(path):
+    """Returns {TICKER: (industry, sector)}. Never raises: warns and returns {}."""
+    if not os.path.exists(path):
+        print(f"⚠ WARNING: {path} not found — NO custom industry overrides applied.")
+        return {}
+    try:
+        odf = pd.read_csv(path, dtype=str)
+        odf.columns = [str(c).strip() for c in odf.columns]
+        missing = {"Ticker", "Industry", "Sector"} - set(odf.columns)
+        if missing:
+            print(f"⚠ WARNING: industry_overrides.csv is missing column(s) {sorted(missing)} "
+                  f"— NO custom industry overrides applied.")
+            return {}
+        overrides = {}
+        for _, r in odf.iterrows():
+            if pd.isna(r["Ticker"]) or pd.isna(r["Industry"]) or pd.isna(r["Sector"]):
+                print(f"⚠ Skipping incomplete override row: {r.to_dict()}")
+                continue
+            t = str(r["Ticker"]).strip().upper()
+            ind = str(r["Industry"]).strip()
+            sec = str(r["Sector"]).strip()
+            if not t or not ind or not sec:
+                print(f"⚠ Skipping incomplete override row: {r.to_dict()}")
+                continue
+            if t in overrides:
+                print(f"⚠ Duplicate ticker {t} in overrides — last entry wins.")
+            overrides[t] = (ind, sec)
+        print(f"✓ Loaded {len(overrides)} industry overrides "
+              f"({len({v[0] for v in overrides.values()})} custom industries).")
+        return overrides
+    except Exception as exc:
+        print(f"⚠ WARNING: could not read industry_overrides.csv ({exc}) "
+              f"— NO custom industry overrides applied.")
+        return {}
+
+INDUSTRY_OVERRIDES = load_industry_overrides(OVERRIDES_FILE)
+
 # ── Column titles ─────────────────────────────────────────────────────────────
 
 TITLE_RANK       = "Rank"
@@ -147,6 +190,8 @@ def rankings():
     ind_ranks = []
     stock_rs = {}
     ref = price_data[REFERENCE_TICKER]
+    override_ranked = set()      # override tickers that made it into the ranking
+    override_skipped = {}        # override ticker -> reason it did not
 
     for ticker in price_data:
         if not cfg("SP500") and price_data[ticker].get("universe") == "S&P 500":
@@ -162,22 +207,32 @@ def rankings():
             closes     = [c["close"] for c in candles]
             closes_ref = [c["close"] for c in ref["candles"]]
 
-            industry = (
-                TICKER_INFO_DICT[ticker]["info"]["industry"]
-                if price_data[ticker].get("industry") == "unknown"
-                else price_data[ticker].get("industry", "unknown")
-            )
-            sector = (
-                TICKER_INFO_DICT[ticker]["info"]["sector"]
-                if price_data[ticker].get("sector") == "unknown"
-                else price_data[ticker].get("sector", "unknown")
-            )
+            override = INDUSTRY_OVERRIDES.get(ticker.upper())
+            if override:
+                # Your custom industry/sector wins over the data source.
+                industry, sector = override
+            else:
+                industry = (
+                    TICKER_INFO_DICT[ticker]["info"]["industry"]
+                    if price_data[ticker].get("industry") == "unknown"
+                    else price_data[ticker].get("industry", "unknown")
+                )
+                sector = (
+                    TICKER_INFO_DICT[ticker]["info"]["sector"]
+                    if price_data[ticker].get("sector") == "unknown"
+                    else price_data[ticker].get("sector", "unknown")
+                )
 
             # Skip tickers with no sector AND no industry — likely ETFs or
-            # structured products that slipped through the NASDAQ ETF filter
+            # structured products that slipped through the NASDAQ ETF filter.
+            # (Runs AFTER the override lookup so overridden tickers are never
+            # dropped for missing source data.)
             no_data = ("unknown", "n/a", "Unknown", "N/A", None, "")
             if sector in no_data and industry in no_data:
                 continue
+
+            if override and len(closes) < 6 * 20:
+                override_skipped[ticker.upper()] = f"only {len(closes)} days of history (need {6 * 20})"
 
             if len(closes) >= 6 * 20:
                 cs  = pd.Series(closes)
@@ -217,6 +272,8 @@ def rankings():
                         av10, av30, av50, rev_growth
                     ))
                     stock_rs[ticker] = rs
+                    if override:
+                        override_ranked.add(ticker.upper())
 
                     # Industries aggregation
                     if industry not in industries:
@@ -231,9 +288,43 @@ def rankings():
                     industries[industry][TITLE_3M].append(rs3m)
                     industries[industry][TITLE_6M].append(rs6m)
                     industries[industry][TITLE_TICKERS].append(ticker)
+                elif override:
+                    override_skipped[ticker.upper()] = f"RS {rs} >= 590 outlier cutoff"
 
         except KeyError:
             print(f'Ticker {ticker} has corrupted data.')
+            if ticker.upper() in INDUSTRY_OVERRIDES:
+                override_skipped[ticker.upper()] = "corrupted/missing price data"
+
+    # ── Override diagnostics (visible in the GitHub Actions log) ─────────────
+    if INDUSTRY_OVERRIDES:
+        price_keys = {t.upper() for t in price_data}
+        not_in_prices = sorted(set(INDUSTRY_OVERRIDES) - price_keys)
+        # In price data but never reached ranking and no reason recorded yet
+        # (e.g. universe filtered out in config.yaml)
+        for t in sorted((set(INDUSTRY_OVERRIDES) & price_keys) - override_ranked):
+            override_skipped.setdefault(t, "filtered out (universe setting in config.yaml?)")
+
+        print(f"✓ Overrides ranked: {len(override_ranked)} of {len(INDUSTRY_OVERRIDES)} tickers")
+        if not_in_prices:
+            print(f"⚠ {len(not_in_prices)} override ticker(s) NOT in price_history.json: "
+                  f"{', '.join(not_in_prices)}")
+        if override_skipped:
+            print(f"⚠ {len(override_skipped)} override ticker(s) excluded from ranking:")
+            for t in sorted(override_skipped):
+                print(f"    {t}: {override_skipped[t]}")
+
+        custom_inds = sorted({v[0] for v in INDUSTRY_OVERRIDES.values()})
+        thin = []
+        for name in custom_inds:
+            n = len(industries.get(name, {}).get(TITLE_TICKERS, []))
+            if n < 2:
+                thin.append(f"{name} ({n})")
+        if thin:
+            print(f"⚠ Custom industries with <2 ranked tickers (DROPPED from rs_industries.csv): "
+                  f"{', '.join(thin)}")
+        else:
+            print("✓ All custom industries have 2+ ranked tickers.")
 
     dfs = []
 
