@@ -1,14 +1,3 @@
-# RS Rating — IBD Style Relative Strength
-
-> Fork of [Skyte](https://github.com/skyte/relative-strength)'s project, modified by [maximbelyayev](https://github.com/maximbelyayev/relative-strength), maintained by [Fred6725](https://github.com/Fred6725).  
-
-IBD Style Relative Strength Percentile Ranking of Stocks (0-99 score).  
-TradingView indicator using this data: **https://www.tradingview.com/script/pziQwiT2/**
-
----
-# Buy Me A Coffee
-<a href="https://www.buymeacoffee.com/fred6725" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="41" width="174"></a>
----
 
 ## Daily Generated Outputs
 
