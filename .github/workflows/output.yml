@@ -1,11 +1,7 @@
 name: Generate RS Ratings
 
 on:
-  schedule:
-    # Runs Tuesday through Saturday at 02:17 UTC
-    # (Monday through Friday at 9:17 PM EST)
-    - cron: '17 2 * * 2-6'
-  workflow_dispatch: # Allows manual runs from the Actions tab
+  workflow_dispatch: # Manual / external trigger only (no schedule)
 
 jobs:
   generate-rs:
