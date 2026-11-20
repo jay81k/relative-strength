@@ -6,10 +6,6 @@
 #   3. Batch yfinance downloads (100 tickers at a time) → ~25 min instead of hours
 #   4. Removed broken session/user-agent hack (curl_cffi handles this transparently)
 #   5. pandas 2.x compatible (MultiIndex column handling)
-#   6. end_date = today + 1 day (yfinance 'end' is exclusive, so today's bar was never requested)
-#   7. Yahoo sometimes returns a NULL daily close for thinly traded tickers (volume present, close missing),
-#      which the parser drops. patch_stale_last_candles() fills that day's close from Yahoo's regular-session
-#      price, only when it is verifiably the same session date, and flags anything still stale.
 
 import requests
 import json
@@ -20,7 +16,6 @@ import yaml
 import yfinance as yf
 import pandas as pd
 import dateutil.relativedelta
-from dateutil import tz
 import numpy as np
 import re
 from io import StringIO
@@ -532,7 +527,7 @@ def load_prices_from_yahoo(securities, info={}):
     print("*** Loading Stocks from Yahoo Finance (batch mode) ***")
     today = date.today()
     start_date = today - dt.timedelta(days=1 * 365 + 183)  # 18 months of data
-    end_date = today + dt.timedelta(days=1)  # yfinance 'end' is exclusive: +1 day so today's bar is included
+    end_date = today
 
     securities_list = list(securities)
     tickers_dict = {}
@@ -650,9 +645,6 @@ def load_prices_from_yahoo(securities, info={}):
             write_price_history_file(tickers_dict)
             write_ticker_info_file(TICKER_INFO_DICT)
 
-    # Fix stale last candles (null daily close from Yahoo), then final save
-    patch_stale_last_candles(tickers_dict)
-
     # Final save
     write_price_history_file(tickers_dict)
     write_ticker_info_file(TICKER_INFO_DICT)
@@ -666,132 +658,6 @@ def load_prices_from_yahoo(securities, info={}):
             f.write("\n".join(unique_failed))
 
     return tickers_dict
-
-# ── Stale last-candle patch ──────────────────────────────────────────────────
-# Yahoo sometimes returns a daily bar with volume but a NULL close (seen on thinly traded
-# NYSE tickers). parse_batch_download drops NaN-close rows, so the ticker's last candle
-# silently becomes the previous day. This fills that day's close from Yahoo's regular-session
-# price -- but ONLY when Yahoo says that price was traded on the expected session date.
-
-NY_TZ = tz.gettz("America/New_York")
-
-
-def _candle_date(candle):
-    return datetime.fromtimestamp(candle["datetime"]).date()
-
-
-def _market_time_date(md):
-    """New York date of the last regular-session trade, from yfinance history metadata. None if unknown."""
-    t = md.get("regularMarketTime") if md else None
-    if t is None:
-        return None
-    try:
-        if isinstance(t, (int, float)):
-            return datetime.fromtimestamp(t, tz=NY_TZ).date()
-        ts = pd.Timestamp(t)
-        if ts.tzinfo is None:
-            return None  # naive timestamp: can't tell the timezone, so don't trust it
-        return ts.tz_convert(NY_TZ).date()
-    except Exception:
-        return None
-
-
-def _num(x):
-    try:
-        return None if x is None or pd.isna(x) else float(x)
-    except (TypeError, ValueError):
-        return None
-
-
-def patch_stale_last_candles(tickers_dict, now_et=None):
-    """
-    Detect tickers whose newest candle is older than the newest candle in the whole download,
-    patch the missing close from Yahoo's regular-session price when it is safe, and flag the rest.
-    Returns the list of tickers still stale afterwards.
-    """
-    if NY_TZ is None:
-        print("⚠ New York timezone data unavailable: stale-candle patch skipped.")
-        return []
-
-    last_dates = {t: _candle_date(d["candles"][-1]) for t, d in tickers_dict.items() if d.get("candles")}
-    if not last_dates:
-        return []
-    expected = max(last_dates.values())
-    stale = [t for t, d in last_dates.items() if d < expected]
-
-    print(f"\n── Freshness check ──\n  Newest candle date in this download: {expected}")
-    if not stale:
-        print("  All tickers have the newest candle.")
-        _write_stale_file([], last_dates, expected)
-        return []
-    print(f"  {len(stale)} tickers are behind it.")
-
-    now_et = now_et or datetime.now(NY_TZ)
-    session_close = datetime.combine(expected, dt.time(16, 10), tzinfo=NY_TZ)
-    if now_et < session_close:
-        print(f"  Session for {expected} is not over yet (before 16:10 ET): not patching, flagging as stale.")
-        remaining = list(stale)
-    else:
-        remaining = []
-        patched = []
-        for t in stale:
-            try:
-                tk = yf.Ticker(escape_ticker(t))
-                h = tk.history(period="5d", interval="1d", auto_adjust=True)
-                md = tk.get_history_metadata() or {}
-                price = _num(md.get("regularMarketPrice"))
-                # Safety: must be a real price AND Yahoo must say it traded on the expected session date.
-                # (A halted/no-trade ticker has an older regularMarketTime and is left stale on purpose.)
-                if price is None or price <= 0 or _market_time_date(md) != expected:
-                    remaining.append(t)
-                    continue
-                row = None
-                if h is not None and not h.empty:
-                    for ts, r in h.iterrows():
-                        if pd.Timestamp(ts).date() == expected:
-                            row = r
-                high = _num(row.get("High")) if row is not None else None
-                low = _num(row.get("Low")) if row is not None else None
-                if high is None:
-                    high = _num(md.get("regularMarketDayHigh"))
-                if low is None:
-                    low = _num(md.get("regularMarketDayLow"))
-                volume = _num(row.get("Volume")) if row is not None else None
-                if volume is None:
-                    volume = _num(md.get("regularMarketVolume"))
-                if high is not None and price > high:
-                    high = price
-                if low is not None and price < low:
-                    low = price
-                tickers_dict[t]["candles"].append({
-                    "open":     _num(row.get("Open")) if row is not None else None,
-                    "close":    float(price),
-                    "low":      low,
-                    "high":     high,
-                    "volume":   volume,
-                    "datetime": int(datetime.combine(expected, dt.time(0, 0)).timestamp()),
-                })
-                tickers_dict[t]["last_close_source"] = "yahoo_regular_market_price"
-                patched.append(t)
-                time.sleep(0.15)
-            except Exception as e:
-                print(f"  Could not patch {t}: {e}")
-                remaining.append(t)
-        print(f"  Patched {len(patched)} tickers from Yahoo's regular-session price: "
-              f"{patched[:15]}{'...' if len(patched) > 15 else ''}")
-
-    for t in remaining:
-        tickers_dict[t]["stale"] = True
-    print(f"  Still stale: {len(remaining)} tickers"
-          + (f" -> {remaining[:15]}{'...' if len(remaining) > 15 else ''}" if remaining else ""))
-    _write_stale_file(remaining, last_dates, expected)
-    return remaining
-
-
-def _write_stale_file(tickers, last_dates, expected):
-    with open(os.path.join(DIR, "stale_tickers.txt"), "w") as f:
-        f.write("\n".join(f"{t}\tlast candle {last_dates[t]} (expected {expected})" for t in tickers))
-
 
 # ── TD Ameritrade (kept for compatibility, not actively maintained) ────────────
 
