@@ -89,6 +89,10 @@ INDUSTRY_OVERRIDES = load_industry_overrides(OVERRIDES_FILE)
 # not appear in rs_stocks.csv, the percentiles, or any industry average.
 EXCLUDE_FILE = os.path.join(DIR, "excluded_tickers.csv")
 
+# Industries dropped from ranking entirely (SPACs / blank-check shells). Compared lower-case.
+# A ticker listed in industry_overrides.csv is NOT dropped (your override wins).
+SHELL_INDUSTRIES = {"shell companies", "shell company"}
+
 def load_excluded_tickers(path):
     """Returns a set of uppercase tickers. Never raises: warns and returns set()."""
     if not os.path.exists(path):
@@ -231,6 +235,7 @@ def rankings():
     override_ranked = set()      # override tickers that made it into the ranking
     override_skipped = {}        # override ticker -> reason it did not
     excluded_skipped = set()     # excluded tickers actually found and skipped
+    shell_skipped = []           # shell companies / SPACs skipped by industry
 
     for ticker in price_data:
         if ticker.upper() in EXCLUDED_TICKERS:
@@ -264,6 +269,11 @@ def rankings():
                     if price_data[ticker].get("sector") == "unknown"
                     else price_data[ticker].get("sector", "unknown")
                 )
+
+            # Skip shell companies / SPACs (industry "Shell Companies"). An override wins.
+            if not override and str(industry).strip().lower() in SHELL_INDUSTRIES:
+                shell_skipped.append(ticker.upper())
+                continue
 
             # Skip tickers with no sector AND no industry — likely ETFs or
             # structured products that slipped through the NASDAQ ETF filter.
@@ -380,6 +390,8 @@ def rankings():
         if not_found:
             print(f"⚠ {len(not_found)} excluded ticker(s) NOT in price_history.json "
                   f"(typo, or already gone?): {', '.join(not_found)}")
+
+    print(f"✓ Skipped {len(shell_skipped)} shell companies (industry: Shell Companies).")
 
     dfs = []
 
