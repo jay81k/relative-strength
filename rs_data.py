@@ -527,7 +527,7 @@ def load_prices_from_yahoo(securities, info={}):
     print("*** Loading Stocks from Yahoo Finance (batch mode) ***")
     today = date.today()
     start_date = today - dt.timedelta(days=1 * 365 + 183)  # 18 months of data
-    end_date = today
+    end_date = today + dt.timedelta(days=1)  # yfinance 'end' is exclusive — without +1 day, today is dropped
 
     securities_list = list(securities)
     tickers_dict = {}
