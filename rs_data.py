@@ -1,13 +1,11 @@
 #!/usr/bin/env python
-# rs_data.py — Fixed version + Questrade API support
+# rs_data.py — Fixed version
 # Changes vs original:
 #   1. Python 3.10+ compatible (removed FTP, fixed imports)
 #   2. NASDAQ ticker list via HTTPS instead of FTP
 #   3. Batch yfinance downloads (100 tickers at a time) → ~25 min instead of hours
 #   4. Removed broken session/user-agent hack (curl_cffi handles this transparently)
 #   5. pandas 2.x compatible (MultiIndex column handling)
-#   6. Questrade API data source (DATA_SOURCE: QUESTRADE) with incremental candle updates,
-#      symbolId caching, direct access-token auth, and preserved Yahoo sector/industry.
 
 import requests
 import json
@@ -24,14 +22,12 @@ from io import StringIO
 from time import sleep
 
 from datetime import date
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 
 DIR = os.path.dirname(os.path.realpath(__file__))
 
 if not os.path.exists(os.path.join(DIR, 'data')):
     os.makedirs(os.path.join(DIR, 'data'))
-if not os.path.exists(os.path.join(DIR, 'data_persist')):
-    os.makedirs(os.path.join(DIR, 'data_persist'))
 if not os.path.exists(os.path.join(DIR, 'tmp')):
     os.makedirs(os.path.join(DIR, 'tmp'))
 
@@ -56,15 +52,13 @@ except yaml.YAMLError as exc:
 def cfg(key):
     try:
         return private_config[key]
-    except Exception:
+    except:
         try:
             return config[key]
-        except Exception:
+        except:
             return None
 
 def read_json(json_file):
-    if not os.path.exists(json_file):
-        return {}
     with open(json_file, "r", encoding="utf-8") as fp:
         return json.load(fp)
 
@@ -78,7 +72,6 @@ DATA_SOURCE = cfg("DATA_SOURCE")
 ALL_STOCKS = cfg("USE_ALL_LISTED_STOCKS")
 TICKER_INFO_FILE = os.path.join(DIR, "data_persist", "ticker_info.json")
 TICKER_INFO_DICT = read_json(TICKER_INFO_FILE)
-QUESTRADE_SYMBOLS_FILE = os.path.join(DIR, "data_persist", "questrade_symbols.json")
 REF_TICKER = {
     "ticker": REFERENCE_TICKER,
     "sector": "--- Reference ---",
@@ -134,10 +127,11 @@ def get_sp500_tickers(universe="S&P 500"):
     try:
         tables = pd.read_html(url, header=0, attrs={"class": "wikitable"}, storage_options={"User-Agent": headers["User-Agent"]})
     except Exception:
+        # Fallback: fetch manually then parse
         resp = requests.get(url, headers=headers, timeout=30)
         tables = pd.read_html(StringIO(resp.text), header=0)
 
-    df = tables[0]
+    df = tables[0]  # First table = current components
     ticker_col, sector_col, industry_col = _find_ticker_sector_cols(
         df,
         ticker_candidates=["Symbol", "Ticker", "Tick"],
@@ -173,6 +167,7 @@ def get_nq100_tickers(universe="Nasdaq 100"):
         resp = requests.get(url, headers=headers, timeout=30)
         tables = pd.read_html(StringIO(resp.text), header=0)
 
+    # The NQ100 component table is usually the largest one on the page
     df = max(tables, key=lambda t: len(t))
     ticker_col, sector_col, industry_col = _find_ticker_sector_cols(
         df,
@@ -241,6 +236,7 @@ def get_resolved_securities():
 def get_tickers_from_wikipedia(tickers):
     """
     Load index components from Wikipedia using pd.read_html() with dynamic column detection.
+    Much more robust than BeautifulSoup + positional offsets.
     """
     if cfg("NQ100"):
         try:
@@ -290,17 +286,20 @@ def get_tickers_from_nasdaq(tickers):
         lines = r.text.splitlines()
     except Exception as e:
         print(f"HTTPS download failed ({e}), trying fallback URL...")
+        # Fallback to alternate URL
         url2 = "https://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqtraded.txt"
         r = requests.get(url2, timeout=60)
         lines = r.text.splitlines()
 
+    # Columns: Nasdaq Traded | Symbol | Security Name | Listing Exchange | Market Category |
+    #          ETF | Round Lot Size | Test Issue | Financial Status | ...
     ticker_col = 1
     etf_col = 5
     exchange_col = 3
     test_col = 7
 
     count_added = 0
-    for entry in lines[1:]:
+    for entry in lines[1:]:  # skip header
         values = entry.split('|')
         if len(values) <= max(ticker_col, etf_col, exchange_col, test_col):
             continue
@@ -377,7 +376,9 @@ def _safe_float(d, key):
 
 def load_ticker_info(ticker, info_dict):
     """
-    Fetch and cache ticker metadata from yfinance.
+    Fetch and cache ticker metadata.
+    Uses fast_info (yfinance 1.x, snake_case) for price/market data — much more reliable.
+    Falls back to .info for sector/industry/float/short which aren't in fast_info.
     """
     escaped = escape_ticker(ticker)
     result = {
@@ -391,6 +392,7 @@ def load_ticker_info(ticker, info_dict):
     try:
         t = yf.Ticker(escaped)
 
+        # ── fast_info: reliable in yfinance 1.x, camelCase keys ─────────────
         try:
             fi = t.fast_info
             result["marketCap"]        = _safe_float(fi, "marketCap")
@@ -400,6 +402,7 @@ def load_ticker_info(ticker, info_dict):
         except Exception:
             pass
 
+        # ── .info: uniquement pour sector/industry/short qui ne sont pas dans fast_info ──
         try:
             info_obj = t.info
             result["industry"]            = get_info_from_dict(info_obj, "industry")
@@ -409,8 +412,10 @@ def load_ticker_info(ticker, info_dict):
                 _safe_float(info_obj, "shortRatio")
             )
             result["revenueGrowth"] = _safe_float(info_obj, "revenueGrowth")
+            # marketCap fallback si fast_info n'a rien retourné
             if result["marketCap"] is None:
                 result["marketCap"] = _safe_float(info_obj, "marketCap")
+            # Map yfinance exchange code to readable name
             result["exchange"] = exchange_from_yfinance(info_obj.get("exchange", ""))
         except Exception:
             pass
@@ -423,277 +428,13 @@ def load_ticker_info(ticker, info_dict):
 def needs_refresh(ticker, info_dict):
     """
     True if cached entry is missing the new market data fields.
+    Triggers a one-time re-fetch on first run after this update.
     """
     try:
         info = info_dict[ticker]["info"]
         return "marketCap" not in info or "revenueGrowth" not in info or "exchange" not in info
     except (KeyError, TypeError):
         return True
-
-# ── Core: Questrade API client & price loader ─────────────────────────────────
-
-class QuestradeClient:
-    """
-    Minimal Questrade REST client using a manually supplied access_token & api_server.
-      - Rate-limit pacing (safe for 20 req/s market data, 30 req/s symbol calls)
-      - 429 retry honoring X-RateLimit-Reset
-    """
-    def __init__(self, access_token, api_server="https://api01.iq.questrade.com/"):
-        self.access_token = (access_token or "").strip()
-        if not self.access_token:
-            raise ValueError(
-                "Missing Questrade access token. Set QUESTRADE_ACCESS_TOKEN env var "
-                "(or in config_private.yaml)."
-            )
-        self.api_server = (api_server or "https://api01.iq.questrade.com/").rstrip("/") + "/"
-        self.session = requests.Session()
-        self._last_market_call = 0.0
-
-    def _get(self, path, params=None, is_market_data=True, max_retries=4):
-        url = f"{self.api_server}{path.lstrip('/')}"
-        headers = {"Authorization": f"Bearer {self.access_token}"}
-
-        for attempt in range(max_retries):
-            # Pace market-data calls to ~15 req/sec (well below 20 req/sec limit)
-            if is_market_data:
-                elapsed = time.time() - self._last_market_call
-                if elapsed < 0.068:
-                    sleep(0.068 - elapsed)
-                self._last_market_call = time.time()
-
-            resp = self.session.get(url, headers=headers, params=params, timeout=30)
-
-            if resp.status_code == 200:
-                return resp.json()
-
-            if resp.status_code == 401:
-                raise RuntimeError(
-                    "Questrade access token expired or invalid (HTTP 401). "
-                    "Generate a fresh access_token and retry."
-                )
-
-            if resp.status_code == 429:
-                reset_ts = resp.headers.get("X-RateLimit-Reset")
-                wait_s = 2.0
-                if reset_ts:
-                    try:
-                        wait_s = max(1.0, min(15.0, float(reset_ts) - time.time() + 0.5))
-                    except ValueError:
-                        wait_s = 2.0
-                print(f"  ⏳ Questrade 429 rate limit — waiting {wait_s:.1f}s...")
-                sleep(wait_s)
-                continue
-
-            if resp.status_code >= 500:
-                sleep(1.5 * (attempt + 1))
-                continue
-
-            # 4xx (e.g., 404 symbol not found) — don't retry
-            return None
-
-        return None
-
-    def get_symbols_by_names(self, names):
-        """Batch lookup up to ~50 symbol names at once via GET v1/symbols?names=..."""
-        data = self._get("v1/symbols", params={"names": ",".join(names)}, is_market_data=False)
-        return data.get("symbols", []) if data else []
-
-    def get_symbols_by_ids(self, symbol_ids):
-        """Batch lookup up to ~50 symbol IDs at once via GET v1/symbols?ids=..."""
-        ids_str = ",".join(str(sid) for sid in symbol_ids)
-        data = self._get("v1/symbols", params={"ids": ids_str}, is_market_data=False)
-        return data.get("symbols", []) if data else []
-
-    def get_daily_candles(self, symbol_id, start_dt, end_dt):
-        """Fetch OneDay OHLCV candles for a numeric symbolId."""
-        params = {
-            "startTime": start_dt.strftime("%Y-%m-%dT00:00:00-05:00"),
-            "endTime": end_dt.strftime("%Y-%m-%dT23:59:59-05:00"),
-            "interval": "OneDay",
-        }
-        data = self._get(f"v1/markets/candles/{symbol_id}", params=params, is_market_data=True)
-        return data.get("candles", []) if data else []
-
-
-def _to_questrade_symbol(ticker):
-    """Wikipedia uses BRK-B; Questrade uses BRK.B."""
-    return ticker.replace("-", ".")
-
-
-def _parse_qt_candles(raw_candles):
-    """Convert Questrade candle objects to the exact schema expected by rs_ranking.py."""
-    candles = []
-    for c in raw_candles:
-        close = c.get("close")
-        if close is None:
-            continue
-        start_str = c.get("start", "")
-        try:
-            ts = int(datetime.fromisoformat(start_str).timestamp())
-        except Exception:
-            ts = 0
-        candles.append({
-            "open":     float(c["open"])   if c.get("open")   is not None else None,
-            "close":    float(close),
-            "low":      float(c["low"])    if c.get("low")    is not None else None,
-            "high":     float(c["high"])   if c.get("high")   is not None else None,
-            "volume":   float(c["volume"]) if c.get("volume") is not None else None,
-            "datetime": ts,
-        })
-    return candles
-
-
-def _merge_candles(existing_candles, new_candles, max_days=400):
-    """Merge existing and newly fetched daily candles by calendar date, keeping last max_days."""
-    by_day = {}
-    for c in existing_candles:
-        day_key = datetime.fromtimestamp(c["datetime"], tz=timezone.utc).strftime("%Y-%m-%d")
-        by_day[day_key] = c
-    for c in new_candles:
-        day_key = datetime.fromtimestamp(c["datetime"], tz=timezone.utc).strftime("%Y-%m-%d")
-        by_day[day_key] = c
-    merged = [by_day[k] for k in sorted(by_day)]
-    return merged[-max_days:]
-
-
-def load_prices_from_questrade(securities, info={}):
-    """
-    Fetch closing prices and volumes from Questrade API.
-    - Reuses existing price_history.json and does incremental 7-day updates for known tickers.
-    - Preserves existing sector/industry in ticker_info.json (only falls back to yfinance
-      for brand-new tickers not yet in ticker_info.json).
-    - Refreshes marketCap and fiftyTwoWeekHigh from Questrade's batch /v1/symbols endpoint.
-    """
-    print("*** Loading Stocks from Questrade API ***")
-    access_token = os.environ.get("QUESTRADE_ACCESS_TOKEN") or cfg("QUESTRADE_ACCESS_TOKEN")
-    api_server = os.environ.get("QUESTRADE_API_SERVER") or cfg("QUESTRADE_API_SERVER") or "https://api01.iq.questrade.com/"
-    qt = QuestradeClient(access_token, api_server)
-
-    securities_list = list(securities)
-    ref_sec = next((s for s in securities_list if s["ticker"] == REFERENCE_TICKER), None)
-    non_ref = [s for s in securities_list if s["ticker"] != REFERENCE_TICKER]
-    ordered = ([ref_sec] if ref_sec else []) + non_ref
-
-    existing_prices = read_json(PRICE_DATA_FILE)
-    symbol_map = read_json(QUESTRADE_SYMBOLS_FILE)  # {ticker: symbolId}
-
-    # 1. Resolve missing ticker -> symbolId mappings in batches of 50
-    missing_tickers = [s["ticker"] for s in ordered if s["ticker"] not in symbol_map]
-    if missing_tickers:
-        print(f"Resolving {len(missing_tickers)} new symbol IDs from Questrade...")
-        for i in range(0, len(missing_tickers), 50):
-            chunk = missing_tickers[i:i + 50]
-            qt_names = [_to_questrade_symbol(t) for t in chunk]
-            qt_to_orig = {_to_questrade_symbol(t).upper(): t for t in chunk}
-            for sym in qt.get_symbols_by_names(qt_names):
-                name = str(sym.get("symbol", "")).upper()
-                orig = qt_to_orig.get(name)
-                if orig and sym.get("symbolId"):
-                    symbol_map[orig] = sym["symbolId"]
-        write_to_file(symbol_map, QUESTRADE_SYMBOLS_FILE)
-        print(f"✓ Symbol ID cache updated ({len(symbol_map)} total).")
-
-    # 2. Refresh marketCap & fiftyTwoWeekHigh in batches of 50 WITHOUT touching sector/industry
-    resolved_sids = [symbol_map[s["ticker"]] for s in ordered if s["ticker"] in symbol_map]
-    sid_to_ticker = {symbol_map[s["ticker"]]: s["ticker"] for s in ordered if s["ticker"] in symbol_map}
-    print(f"Refreshing marketCap & 52wk high for {len(resolved_sids)} symbols...")
-    for i in range(0, len(resolved_sids), 50):
-        chunk_ids = resolved_sids[i:i + 50]
-        for sym in qt.get_symbols_by_ids(chunk_ids):
-            ticker = sid_to_ticker.get(sym.get("symbolId"))
-            if not ticker:
-                continue
-            if ticker not in TICKER_INFO_DICT:
-                load_ticker_info(ticker, TICKER_INFO_DICT)
-            info_entry = TICKER_INFO_DICT.setdefault(ticker, {}).setdefault("info", {
-                "industry": "n/a", "sector": "n/a",
-                "marketCap": None, "floatShares": None,
-                "shortPercentOfFloat": None,
-                "fiftyTwoWeekHigh": None, "fiftyTwoWeekLow": None,
-                "revenueGrowth": None,
-            })
-            if sym.get("marketCap") is not None:
-                info_entry["marketCap"] = float(sym["marketCap"])
-            if sym.get("highPrice52") is not None:
-                info_entry["fiftyTwoWeekHigh"] = float(sym["highPrice52"])
-            if sym.get("lowPrice52") is not None:
-                info_entry["fiftyTwoWeekLow"] = float(sym["lowPrice52"])
-
-    # 3. Fetch daily candles (incremental 7-day fetch if history exists, 18-month backfill if new)
-    today = date.today()
-    full_start = today - timedelta(days=1 * 365 + 183)
-    incr_start = today - timedelta(days=7)
-
-    tickers_dict = {}
-    failed_tickers = []
-    total = len(ordered)
-    global_start = time.time()
-
-    for idx, sec in enumerate(ordered, start=1):
-        ticker = sec["ticker"]
-        sid = symbol_map.get(ticker)
-        if not sid:
-            failed_tickers.append(ticker)
-            continue
-
-        prev_candles = existing_prices.get(ticker, {}).get("candles", [])
-        use_incremental = len(prev_candles) >= 120
-        start_dt = incr_start if use_incremental else full_start
-
-        raw_candles = qt.get_daily_candles(sid, start_dt, today)
-        new_candles = _parse_qt_candles(raw_candles)
-
-        if use_incremental:
-            candles = _merge_candles(prev_candles, new_candles)
-        else:
-            candles = new_candles
-
-        if not candles:
-            failed_tickers.append(ticker)
-            continue
-
-        ticker_data = {"candles": candles}
-        enrich_ticker_data(ticker_data, sec)
-
-        if ticker not in TICKER_INFO_DICT:
-            load_ticker_info(ticker, TICKER_INFO_DICT)
-
-        try:
-            ticker_data["industry"] = TICKER_INFO_DICT[ticker]["info"]["industry"]
-            ticker_data["sector"]   = TICKER_INFO_DICT[ticker]["info"]["sector"]
-        except (KeyError, TypeError):
-            ticker_data["industry"] = "Unknown"
-
-        try:
-            yf_exchange = TICKER_INFO_DICT[ticker]["info"].get("exchange")
-            if yf_exchange and ticker_data.get("universe") in (None, "n/a", UNKNOWN):
-                ticker_data["universe"] = yf_exchange
-        except (KeyError, TypeError):
-            pass
-
-        tickers_dict[ticker] = ticker_data
-
-        if idx % 250 == 0 or idx == total:
-            elapsed = time.time() - global_start
-            rate = idx / elapsed if elapsed > 0 else 1
-            rem_s = (total - idx) / rate
-            print(f"[{idx}/{total}] {len(tickers_dict)} OK | Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s | Remaining: {int(rem_s // 60)}m {int(rem_s % 60)}s")
-
-        if idx % 500 == 0:
-            write_price_history_file(tickers_dict)
-            write_ticker_info_file(TICKER_INFO_DICT)
-
-    write_price_history_file(tickers_dict)
-    write_ticker_info_file(TICKER_INFO_DICT)
-
-    total_time = time.time() - global_start
-    print(f"\n✓ Questrade done: {len(tickers_dict)} tickers updated in {int(total_time // 60)}m {int(total_time % 60)}s")
-    if failed_tickers:
-        print(f"✗ {len(failed_tickers)} tickers had no Questrade data: {failed_tickers[:20]}{'...' if len(failed_tickers) > 20 else ''}")
-        with open(os.path.join(DIR, "failed_tickers.txt"), "w") as f:
-            f.write("\n".join(failed_tickers))
-
-    return tickers_dict
 
 # ── Core: batch price download from Yahoo ─────────────────────────────────────
 
@@ -719,6 +460,7 @@ def parse_batch_download(df, batch_tickers):
     if df is None or df.empty:
         return result
 
+    # Single ticker: flat columns (no MultiIndex)
     if not isinstance(df.columns, pd.MultiIndex):
         ticker = batch_tickers[0]
         df_t = df.copy()
@@ -741,14 +483,18 @@ def parse_batch_download(df, batch_tickers):
             result[ticker] = candles
         return result
 
+    # Multiple tickers: MultiIndex columns (Field, Ticker)
+    # Swap levels so we can access by ticker first
     df_swapped = df.swaplevel(axis=1)
 
     for ticker in batch_tickers:
+        # yfinance may have altered the ticker name (e.g. "BRK.B" -> "BRK-B")
         yf_ticker = escape_ticker(ticker)
         try:
             df_t = df_swapped[yf_ticker] if yf_ticker in df_swapped.columns.get_level_values(0) else df_swapped.get(yf_ticker)
             if df_t is None or df_t.empty:
                 continue
+            # drop rows where Close is NaN
             df_t = df_t.dropna(subset=["Close"])
             if df_t.empty:
                 continue
@@ -766,29 +512,36 @@ def parse_batch_download(df, batch_tickers):
             if candles:
                 result[ticker] = candles
         except (KeyError, TypeError):
+            # ticker not in this batch result — silently skip
             pass
 
     return result
 
 def load_prices_from_yahoo(securities, info={}):
     """
-    Main download function for Yahoo Finance.
+    Main download function.
+    Downloads in batches of BATCH_SIZE tickers for speed (target: ~25 min for 6000+ tickers).
+    curl_cffi (installed via requirements.txt) is used transparently by yfinance to bypass
+    Yahoo's anti-bot measures — no manual session/user-agent tricks needed.
     """
     print("*** Loading Stocks from Yahoo Finance (batch mode) ***")
     today = date.today()
     start_date = today - dt.timedelta(days=1 * 365 + 183)  # 18 months of data
-    end_date = today + dt.timedelta(days=1)  # end is exclusive in yfinance
+    end_date = today
 
     securities_list = list(securities)
     tickers_dict = {}
     failed_tickers = []
 
+    # Separate the reference ticker — download it first, alone
     ref_ticker = REFERENCE_TICKER
     ref_sec = next((s for s in securities_list if s["ticker"] == ref_ticker), None)
     non_ref = [s for s in securities_list if s["ticker"] != ref_ticker]
 
+    # All securities to process (reference first so it's always available)
     ordered = ([ref_sec] if ref_sec else []) + non_ref
 
+    # Build list of (batch_of_securities) chunks
     batches = []
     batch_securities = []
     for sec in ordered:
@@ -811,6 +564,9 @@ def load_prices_from_yahoo(securities, info={}):
         print(f"\n── Batch {batch_idx + 1}/{total_batches}: {len(batch)} tickers ──")
 
         try:
+            # yfinance batch download
+            # auto_adjust=True → split/dividend adjusted prices (default since 0.2.x)
+            # group_by='ticker' → MultiIndex (Ticker, Field) — we swap it in parse_batch_download
             df = yf.download(
                 tickers=batch_tickers,
                 start=start_date,
@@ -825,7 +581,10 @@ def load_prices_from_yahoo(securities, info={}):
             failed_tickers.extend(original_tickers)
             continue
 
+        # Parse the downloaded DataFrame into per-ticker candle lists
         candles_by_ticker = parse_batch_download(df, batch_tickers)
+
+        # Map escaped tickers back to original, enrich with security metadata
         escaped_to_original = {escape_ticker(t): t for t in original_tickers}
 
         for esc_ticker, candles in candles_by_ticker.items():
@@ -837,6 +596,8 @@ def load_prices_from_yahoo(securities, info={}):
             ticker_data = {"candles": candles}
             enrich_ticker_data(ticker_data, sec)
 
+            # Industry / sector / market data info (cached in ticker_info.json)
+            # Re-fetch if missing OR if new fields (marketCap etc.) not yet in cache
             if original not in TICKER_INFO_DICT or needs_refresh(original, TICKER_INFO_DICT):
                 try:
                     load_ticker_info(original, TICKER_INFO_DICT)
@@ -849,6 +610,8 @@ def load_prices_from_yahoo(securities, info={}):
             except (KeyError, TypeError):
                 ticker_data["industry"] = "Unknown"
 
+            # Fallback: if universe wasn't resolved from the NASDAQ listing file,
+            # use the exchange name derived from yfinance (fixes NYQ/NMS/ASE etc.)
             try:
                 yf_exchange = TICKER_INFO_DICT[original]["info"].get("exchange")
                 if yf_exchange and ticker_data.get("universe") in (None, "n/a", UNKNOWN):
@@ -858,10 +621,12 @@ def load_prices_from_yahoo(securities, info={}):
 
             tickers_dict[original] = ticker_data
 
+        # Track tickers with no data
         for t in original_tickers:
             if t not in tickers_dict:
                 failed_tickers.append(t)
 
+        # Timing
         batch_elapsed = time.time() - batch_start
         batch_times.append(batch_elapsed)
         total_elapsed = time.time() - global_start
@@ -874,18 +639,20 @@ def load_prices_from_yahoo(securities, info={}):
         tickers_ok = sum(1 for t in original_tickers if t in tickers_dict)
         print(f"  {tickers_ok}/{len(batch)} tickers OK | Batch time: {batch_elapsed:.1f}s | Remaining: {remaining_str}")
 
+        # Periodic intermediate save (every 10 batches = ~1000 tickers)
         if (batch_idx + 1) % 10 == 0:
             print(f"  → Saving intermediate results ({len(tickers_dict)} tickers so far)...")
             write_price_history_file(tickers_dict)
             write_ticker_info_file(TICKER_INFO_DICT)
 
+    # Final save
     write_price_history_file(tickers_dict)
     write_ticker_info_file(TICKER_INFO_DICT)
 
     total_time = time.time() - global_start
     print(f"\n✓ Done: {len(tickers_dict)} tickers downloaded in {int(total_time // 60)}m {int(total_time % 60)}s")
     if failed_tickers:
-        unique_failed = list(dict.fromkeys(failed_tickers))
+        unique_failed = list(dict.fromkeys(failed_tickers))  # deduplicate
         print(f"✗ {len(unique_failed)} tickers had no data (likely delisted): {unique_failed[:20]}{'...' if len(unique_failed) > 20 else ''}")
         with open(os.path.join(DIR, "failed_tickers.txt"), "w") as f:
             f.write("\n".join(unique_failed))
@@ -939,8 +706,6 @@ def save_data(source, securities, api_key, info={}):
         load_prices_from_yahoo(securities, info)
     elif source == "TD_AMERITRADE":
         load_prices_from_tda(securities, api_key, info)
-    elif source == "QUESTRADE":
-        load_prices_from_questrade(securities, info)
 
 def main(forceTDA=False, api_key=API_KEY):
     dataSource = DATA_SOURCE if not forceTDA else "TD_AMERITRADE"
